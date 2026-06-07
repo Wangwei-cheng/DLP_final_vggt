@@ -1,0 +1,10 @@
+transformers
+accelerate
+supervision
+pycocotools
+timm
+ftfy
+regex
+
+# Optional but useful for exporting / processing object point clouds
+open3d

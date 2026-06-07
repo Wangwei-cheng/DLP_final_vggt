@@ -15,6 +15,14 @@ from datetime import datetime
 import glob
 import gc
 import time
+import json
+from PIL import Image
+from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
+import torch.nn.functional as F
+
+# Import SAM2
+from sam2.build_sam import build_sam2
+from sam2.sam2_image_predictor import SAM2ImagePredictor
 
 sys.path.append("vggt/")
 
@@ -41,10 +49,15 @@ model = model.to(device)
 # -------------------------------------------------------------------------
 # 1) Core model inference
 # -------------------------------------------------------------------------
-def run_model(target_dir, model) -> dict:
+def run_model(target_dir, model, detected_objects=None) -> dict:
     """
     Run the VGGT model on images in the 'target_dir/images' folder and return predictions.
     """
+    if detected_objects:
+        print(f"Backend: Detecting {len(detected_objects)} objects: {detected_objects}")
+    else:
+        print("Backend: No objects specified for detection.")
+
     print(f"Processing images from {target_dir}")
 
     # Device check
@@ -181,7 +194,261 @@ def update_gallery_on_upload(input_video, input_images):
 
 
 # -------------------------------------------------------------------------
-# 4) Reconstruction: uses the target_dir plus any viz parameters
+# 4) Object Detection and Segmentation Pipeline
+# -------------------------------------------------------------------------
+
+def run_groundingdino(target_dir, detected_objects):
+    """
+    Run GroundingDINO on all images in target_dir/images.
+    Return detections_per_frame.
+    """
+    if not detected_objects:
+        return {}
+
+    print(f"Backend: Running GroundingDINO on objects: {detected_objects}")
+    
+    # Load model and processor
+    model_id = "IDEA-Research/grounding-dino-base"
+    processor = AutoProcessor.from_pretrained(model_id)
+    grounding_model = AutoModelForZeroShotObjectDetection.from_pretrained(model_id).to(device)
+    
+    text_prompt = " . ".join(detected_objects) + " ."
+    
+    image_dir = os.path.join(target_dir, "images")
+    image_paths = sorted(glob.glob(os.path.join(image_dir, "*")))
+    
+    detections_per_frame = {}
+    
+    detection_dir = os.path.join(target_dir, "detections")
+    os.makedirs(detection_dir, exist_ok=True)
+    
+    for img_path in image_paths:
+        frame_id = os.path.basename(img_path)
+        image = Image.open(img_path).convert("RGB")
+        
+        inputs = processor(images=image, text=text_prompt, return_tensors="pt").to(device)
+        with torch.no_grad():
+            outputs = grounding_model(**inputs)
+        
+        # Post-process
+        width, height = image.size
+        target_sizes = torch.tensor([[height, width]]).to(device)
+        results = processor.post_process_grounded_object_detection(
+            outputs,
+            inputs.input_ids,
+            target_sizes=target_sizes
+        )[0]
+        
+        frame_detections = []
+        for score, label, box in zip(results["scores"], results["labels"], results["boxes"]):
+            frame_detections.append({
+                "label": label,
+                "score": score.item(),
+                "box": box.cpu().numpy().tolist()
+            })
+        
+        detections_per_frame[frame_id] = frame_detections
+        
+        # Save to JSON for debugging and reuse
+        json_path = os.path.join(detection_dir, f"{os.path.splitext(frame_id)[0]}.json")
+        with open(json_path, "w") as f:
+            json.dump(frame_detections, f, indent=4)
+            
+    print(f"GroundingDINO detection complete for {len(image_paths)} frames.")
+    return detections_per_frame
+
+
+def run_sam2(target_dir, detections_per_frame):
+    """
+    Run SAM2 using GroundingDINO boxes as prompts.
+    Return masks_per_frame and mask metadata.
+    """
+    if not detections_per_frame:
+        return {}, {}
+        
+    print("Backend: Running SAM2 segmentation...")
+    
+    predictor = SAM2ImagePredictor.from_pretrained("facebook/sam2-hiera-large")
+    
+    masks_per_frame = {}
+    mask_metadata = {}
+    
+    mask_dir = os.path.join(target_dir, "masks")
+    os.makedirs(mask_dir, exist_ok=True)
+    
+    for frame_id, detections in detections_per_frame.items():
+        img_path = os.path.join(target_dir, "images", frame_id)
+        image = np.array(Image.open(img_path).convert("RGB"))
+        
+        predictor.set_image(image)
+        
+        frame_masks = []
+        frame_metadata = []
+        
+        frame_mask_dir = os.path.join(mask_dir, os.path.splitext(frame_id)[0])
+        os.makedirs(frame_mask_dir, exist_ok=True)
+        
+        for i, det in enumerate(detections):
+            label = det["label"]
+            box = np.array(det["box"])
+            
+            masks, scores, logits = predictor.predict(
+                box=box,
+                multimask_output=False
+            )
+            
+            best_idx = np.argmax(scores)
+            best_mask = masks[best_idx]
+            best_score = scores[best_idx]
+            
+            mask_filename = f"{label}_{i}.png"
+            mask_path = os.path.join(frame_mask_dir, mask_filename)
+            
+            # Save mask
+            cv2.imwrite(mask_path, (best_mask * 255).astype(np.uint8))
+            
+            frame_masks.append(best_mask)
+            frame_metadata.append({
+                "object_id": f"{label}_{i}",
+                "label": label,
+                "box": det["box"],
+                "mask_path": os.path.relpath(mask_path, target_dir),
+                "detection_score": det["score"],
+                "sam_score": float(best_score)
+            })
+            
+        masks_per_frame[frame_id] = frame_masks
+        mask_metadata[frame_id] = frame_metadata
+        
+    # Save metadata JSON
+    with open(os.path.join(mask_dir, "mask_metadata.json"), "w") as f:
+        json.dump(mask_metadata, f, indent=4)
+        
+    print("SAM2 segmentation complete.")
+    return masks_per_frame, mask_metadata
+
+
+def align_masks_to_vggt(masks_per_frame, mask_metadata, predictions):
+    """
+    Resize SAM2 masks to match VGGT output resolution and keep metadata.
+    """
+    if not masks_per_frame:
+        return {}
+        
+    # predictions["depth"] shape is (S, H, W, 1)
+    target_h, target_w = predictions["depth"].shape[1:3]
+    
+    aligned_results = {}
+    for frame_id, masks in masks_per_frame.items():
+        frame_results = []
+        for mask, meta in zip(masks, mask_metadata[frame_id]):
+            mask_resized = cv2.resize(mask.astype(np.uint8), (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+            frame_results.append({
+                "mask": mask_resized > 0,
+                "label": meta["label"]
+            })
+        aligned_results[frame_id] = frame_results
+    return aligned_results
+
+
+def extract_object_point_clouds(predictions, aligned_results, conf_thres):
+    """
+    Apply object masks to VGGT point maps and confidence maps.
+    Return object-specific point clouds with colors.
+    """
+    if not aligned_results:
+        return {}
+        
+    object_data = {} # {label: {"points": [], "colors": []}}
+    frame_ids = sorted(aligned_results.keys())
+    
+    # Handle image format for colors
+    images = predictions["images"]
+    if images.ndim == 4 and images.shape[1] == 3:  # NCHW
+        images_nhwc = np.transpose(images, (0, 2, 3, 1))
+    else:
+        images_nhwc = images
+
+    for i, frame_id in enumerate(frame_ids):
+        point_map = predictions["world_points_from_depth"][i]
+        conf_map = predictions["depth_conf"][i]
+        color_map = (images_nhwc[i] * 255).astype(np.uint8)
+        
+        flat_conf = conf_map.reshape(-1)
+        threshold_val = np.percentile(flat_conf, conf_thres) if conf_thres > 0 else 0.0
+        
+        for res in aligned_results[frame_id]:
+            mask = res["mask"]
+            label = res["label"]
+            
+            valid_pixels = mask & (conf_map > threshold_val)
+            object_points = point_map[valid_pixels]
+            object_colors = color_map[valid_pixels]
+            
+            if label not in object_data:
+                object_data[label] = {"points": [], "colors": []}
+            object_data[label]["points"].append(object_points)
+            object_data[label]["colors"].append(object_colors)
+            
+    # Concatenate
+    final_object_clouds = {}
+    for label in list(object_data.keys()):
+        if object_data[label]["points"]:
+            pts = np.concatenate(object_data[label]["points"], axis=0)
+            clrs = np.concatenate(object_data[label]["colors"], axis=0)
+            final_object_clouds[label] = {"points": pts, "colors": clrs}
+        else:
+            continue
+            
+    return final_object_clouds
+
+
+def export_object_outputs(object_point_clouds, target_dir, predictions):
+    """
+    Save each object point cloud as PLY and GLB, applying scene alignment.
+    """
+    import trimesh
+    from visual_util import get_opengl_conversion_matrix, apply_scene_alignment
+    
+    if not object_point_clouds:
+        return
+        
+    output_base_dir = os.path.join(target_dir, "object_outputs")
+    os.makedirs(output_base_dir, exist_ok=True)
+    
+    # Get alignment matrix from first camera
+    extrinsics = predictions["extrinsic"]
+    num_cameras = len(extrinsics)
+    extrinsics_matrices = np.zeros((num_cameras, 4, 4))
+    extrinsics_matrices[:, :3, :4] = extrinsics
+    extrinsics_matrices[:, 3, 3] = 1
+    
+    for label, data in object_point_clouds.items():
+        points = data["points"]
+        colors = data["colors"]
+        
+        if points.shape[0] == 0:
+            continue
+            
+        obj_dir = os.path.join(output_base_dir, label)
+        os.makedirs(obj_dir, exist_ok=True)
+        
+        # Create PointCloud
+        pc = trimesh.PointCloud(vertices=points, colors=colors)
+        
+        # Save PLY (original coordinates)
+        pc.export(os.path.join(obj_dir, "point_cloud.ply"))
+        
+        # Create Scene for GLB and apply alignment
+        scene = trimesh.Scene(pc)
+        scene = apply_scene_alignment(scene, extrinsics_matrices)
+        scene.export(os.path.join(obj_dir, "object.glb"))
+        
+    print(f"Backend: Object outputs exported to {output_base_dir}")
+
+
+# -------------------------------------------------------------------------
+# 5) Reconstruction: uses the target_dir plus any viz parameters
 # -------------------------------------------------------------------------
 def gradio_demo(
     target_dir,
@@ -192,12 +459,13 @@ def gradio_demo(
     show_cam=True,
     mask_sky=False,
     prediction_mode="Pointmap Regression",
+    detected_objects=None,
 ):
     """
     Perform reconstruction using the already-created target_dir/images.
     """
     if not os.path.isdir(target_dir) or target_dir == "None":
-        return None, "No valid target directory found. Please upload first.", None, None
+        return None, "No valid target directory found. Please upload first.", None, None, None
 
     start_time = time.time()
     gc.collect()
@@ -211,7 +479,7 @@ def gradio_demo(
 
     print("Running run_model...")
     with torch.no_grad():
-        predictions = run_model(target_dir, model)
+        predictions = run_model(target_dir, model, detected_objects=detected_objects)
 
     # Save predictions
     prediction_save_path = os.path.join(target_dir, "predictions.npz")
@@ -241,6 +509,44 @@ def gradio_demo(
     )
     glbscene.export(file_obj=glbfile)
 
+    object_choices = ["Full Scene"]
+    
+    # --- Object-level Reconstruction Pipeline ---
+    if detected_objects:
+        try:
+            detections_per_frame = run_groundingdino(
+                target_dir=target_dir,
+                detected_objects=detected_objects
+            )
+
+            masks_per_frame, mask_metadata = run_sam2(
+                target_dir=target_dir,
+                detections_per_frame=detections_per_frame
+            )
+
+            aligned_results = align_masks_to_vggt(
+                masks_per_frame=masks_per_frame,
+                mask_metadata=mask_metadata,
+                predictions=predictions
+            )
+
+            object_point_clouds = extract_object_point_clouds(
+                predictions=predictions,
+                aligned_results=aligned_results,
+                conf_thres=conf_thres
+            )
+
+            export_object_outputs(
+                object_point_clouds=object_point_clouds,
+                target_dir=target_dir,
+                predictions=predictions
+            )
+            
+            object_choices += sorted(list(object_point_clouds.keys()))
+        except Exception as e:
+            print(f"Error in object-level pipeline: {e}")
+            # Continue to show full scene even if object extraction fails
+
     # Cleanup
     del predictions
     gc.collect()
@@ -250,7 +556,7 @@ def gradio_demo(
     print(f"Total time: {end_time - start_time:.2f} seconds (including IO)")
     log_msg = f"Reconstruction Success ({len(all_files)} frames). Waiting for visualization."
 
-    return glbfile, log_msg, gr.Dropdown(choices=frame_filter_choices, value=frame_filter, interactive=True)
+    return glbfile, log_msg, gr.Dropdown(choices=frame_filter_choices, value=frame_filter, interactive=True), gr.Dropdown(choices=object_choices, value="Full Scene", interactive=True), "Full Scene"
 
 
 # -------------------------------------------------------------------------
@@ -268,6 +574,23 @@ def update_log():
     Display a quick log message while waiting.
     """
     return "Loading and Reconstructing..."
+
+
+def switch_object_view(target_dir, object_name):
+    """
+    Switches the 3D viewer to show a specific object or the full scene.
+    """
+    if not target_dir or target_dir == "None":
+        return None
+        
+    if object_name == "Full Scene" or not object_name:
+        # Full scene path is tricky because it depends on all params. 
+        # For simplicity, we just look for the first GLB in target_dir that isn't in object_outputs.
+        glbs = glob.glob(os.path.join(target_dir, "*.glb"))
+        return glbs[0] if glbs else None
+    else:
+        obj_glb = os.path.join(target_dir, "object_outputs", object_name, "object.glb")
+        return obj_glb if os.path.exists(obj_glb) else None
 
 
 def update_visualization(
@@ -437,6 +760,13 @@ with gr.Blocks(
         with gr.Column(scale=2):
             input_video = gr.Video(label="Upload Video", interactive=True)
             input_images = gr.File(file_count="multiple", label="Upload Images", interactive=True)
+            detected_objects = gr.Dropdown(
+                label="Objects to detect (Type and press Enter)",
+                choices=[],
+                multiselect=True,
+                allow_custom_value=True,
+                info="Enter the names of objects you want to detect in the scene.",
+            )
 
             image_gallery = gr.Gallery(
                 label="Preview",
@@ -479,16 +809,24 @@ with gr.Blocks(
                     mask_sky = gr.Checkbox(label="Filter Sky", value=False)
                     mask_black_bg = gr.Checkbox(label="Filter Black Background", value=False)
                     mask_white_bg = gr.Checkbox(label="Filter White Background", value=False)
+            
+            with gr.Row():
+                object_selector = gr.Dropdown(
+                    choices=["Full Scene"],
+                    value="Full Scene",
+                    label="Select Object to Visualize",
+                    interactive=True,
+                )
 
     # ---------------------- Examples section ----------------------
     examples = [
-        [colosseum_video, "22", None, 20.0, False, False, True, False, "Depthmap and Camera Branch", "True"],
-        [pyramid_video, "30", None, 35.0, False, False, True, False, "Depthmap and Camera Branch", "True"],
-        [single_cartoon_video, "1", None, 15.0, False, False, True, False, "Depthmap and Camera Branch", "True"],
-        [single_oil_painting_video, "1", None, 20.0, False, False, True, True, "Depthmap and Camera Branch", "True"],
-        [room_video, "8", None, 5.0, False, False, True, False, "Depthmap and Camera Branch", "True"],
-        [kitchen_video, "25", None, 50.0, False, False, True, False, "Depthmap and Camera Branch", "True"],
-        [fern_video, "20", None, 45.0, False, False, True, False, "Depthmap and Camera Branch", "True"],
+        [colosseum_video, "22", None, 20.0, False, False, True, False, "Depthmap and Camera Branch", "True", []],
+        [pyramid_video, "30", None, 35.0, False, False, True, False, "Depthmap and Camera Branch", "True", []],
+        [single_cartoon_video, "1", None, 15.0, False, False, True, False, "Depthmap and Camera Branch", "True", []],
+        [single_oil_painting_video, "1", None, 20.0, False, False, True, True, "Depthmap and Camera Branch", "True", []],
+        [room_video, "8", None, 5.0, False, False, True, False, "Depthmap and Camera Branch", "True", []],
+        [kitchen_video, "25", None, 50.0, False, False, True, False, "Depthmap and Camera Branch", "True", []],
+        [fern_video, "20", None, 45.0, False, False, True, False, "Depthmap and Camera Branch", "True", []],
     ]
 
     def example_pipeline(
@@ -502,6 +840,7 @@ with gr.Blocks(
         mask_sky,
         prediction_mode,
         is_example_str,
+        detected_objects,
     ):
         """
         1) Copy example images to new target_dir
@@ -512,10 +851,18 @@ with gr.Blocks(
         target_dir, image_paths = handle_uploads(input_video, input_images)
         # Always use "All" for frame_filter in examples
         frame_filter = "All"
-        glbfile, log_msg, dropdown = gradio_demo(
-            target_dir, conf_thres, frame_filter, mask_black_bg, mask_white_bg, show_cam, mask_sky, prediction_mode
+        glbfile, log_msg, dropdown, obj_dropdown, selected_obj = gradio_demo(
+            target_dir,
+            conf_thres,
+            frame_filter,
+            mask_black_bg,
+            mask_white_bg,
+            show_cam,
+            mask_sky,
+            prediction_mode,
+            detected_objects=detected_objects,
         )
-        return glbfile, log_msg, target_dir, dropdown, image_paths
+        return glbfile, log_msg, target_dir, dropdown, image_paths, obj_dropdown
 
     gr.Markdown("Click any row to load an example.", elem_classes=["example-log"])
 
@@ -532,8 +879,9 @@ with gr.Blocks(
             mask_sky,
             prediction_mode,
             is_example,
+            detected_objects,
         ],
-        outputs=[reconstruction_output, log_output, target_dir_output, frame_filter, image_gallery],
+        outputs=[reconstruction_output, log_output, target_dir_output, frame_filter, image_gallery, object_selector],
         fn=example_pipeline,
         cache_examples=False,
         examples_per_page=50,
@@ -559,8 +907,9 @@ with gr.Blocks(
             show_cam,
             mask_sky,
             prediction_mode,
+            detected_objects,
         ],
-        outputs=[reconstruction_output, log_output, frame_filter],
+        outputs=[reconstruction_output, log_output, frame_filter, object_selector, object_selector],
     ).then(
         fn=lambda: "False", inputs=[], outputs=[is_example]  # set is_example to "False"
     )
@@ -568,6 +917,12 @@ with gr.Blocks(
     # -------------------------------------------------------------------------
     # Real-time Visualization Updates
     # -------------------------------------------------------------------------
+    object_selector.change(
+        fn=switch_object_view,
+        inputs=[target_dir_output, object_selector],
+        outputs=[reconstruction_output]
+    )
+
     conf_thres.change(
         update_visualization,
         [
